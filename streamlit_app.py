@@ -29,8 +29,7 @@ def init_db(conn):
                pack TEXT NOT NULL,
                protein_per_100g REAL NOT NULL,
                type TEXT CHECK(type IN ("raw", "processed")) NOT NULL DEFAULT "raw",
-               barcode TEXT,
-               UNIQUE(name, pack, COALESCE(barcode, ''))
+               barcode TEXT
            )'''
     )
     # Recipes
@@ -103,6 +102,12 @@ def init_db(conn):
            )'''
     )
     # Defaults if empty
+    # Create uniqueness with partial indexes (SQLite):
+    # - enforce unique (name, pack) when barcode IS NULL
+    # - enforce unique (name, pack, barcode) when barcode IS NOT NULL
+    cur.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_foods_unique_nobarcode ON foods(name, pack) WHERE barcode IS NULL')
+    cur.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_foods_unique_withbarcode ON foods(name, pack, barcode) WHERE barcode IS NOT NULL')
+
     cur.execute('SELECT COUNT(*) FROM thresholds')
     if cur.fetchone()[0] == 0:
         cur.executemany('INSERT INTO thresholds(meal_type, max_protein_g) VALUES (?,?)', [
