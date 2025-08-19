@@ -1,16 +1,15 @@
-import streamlit as st
+
 import sqlite3
 from datetime import datetime, date, timedelta, time
-import pandas as pd
 from typing import Optional, Tuple
-import requests
-import io
-import urllib.parse
+
+import pandas as pd
+import streamlit as st
 
 DB_PATH = 'tracker.db'
 
 # ----------------------------
-# Utilities & DB
+# DB utils
 # ----------------------------
 @st.cache_resource(show_spinner=False)
 def get_conn():
@@ -29,8 +28,7 @@ def init_db(conn):
                pack TEXT NOT NULL,
                protein_per_100g REAL NOT NULL,
                type TEXT CHECK(type IN ("raw", "processed")) NOT NULL DEFAULT "raw",
-               barcode TEXT,
-               UNIQUE(name, pack, COALESCE(barcode, ''))
+               barcode TEXT
            )'''
     )
     # Recipes
@@ -102,6 +100,11 @@ def init_db(conn):
                max_protein_g REAL NOT NULL
            )'''
     )
+
+    # Uniqueness for foods using partial indexes
+    cur.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_foods_unique_nobarcode ON foods(name, pack) WHERE barcode IS NULL')
+    cur.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_foods_unique_withbarcode ON foods(name, pack, barcode) WHERE barcode IS NOT NULL')
+
     # Defaults if empty
     cur.execute('SELECT COUNT(*) FROM thresholds')
     if cur.fetchone()[0] == 0:
@@ -128,9 +131,8 @@ MEAL_LABELS = {
 }
 
 # ----------------------------
-# Helper functions
+# Helpers
 # ----------------------------
-
 def protein_for_food(grams: float, protein_per_100g: float) -> float:
     return round((grams * protein_per_100g) / 100.0, 3)
 
@@ -151,7 +153,7 @@ def get_recipe_items(recipe_id: int) -> pd.DataFrame:
     return pd.read_sql_query(q, conn, params=(recipe_id,))
 
 
-def upsert_food(name: str, pack: str, protein: float, ftype: str, barcode: Optional[str]) -> Tuple[bool, Optional[int], Optional[str]]:
+def upsert_food(name: str, pack: str, protein: float, ftype: str, barcode: Optional[str]):
     try:
         cur = conn.cursor()
         cur.execute(
@@ -165,18 +167,16 @@ def upsert_food(name: str, pack: str, protein: float, ftype: str, barcode: Optio
 
 
 def ensure_unique_recipe_name(name: str) -> str:
-    # If name exists, append date suffix AAAAMMJJ as requested
     cur = conn.cursor()
     cur.execute('SELECT COUNT(*) FROM recipes WHERE name = ?', (name,))
     exists = cur.fetchone()[0] > 0
     if exists:
         suffix = datetime.now().strftime('%Y%m%d')
-        name2 = f"{name}_{suffix}"
-        return name2
+        return f"{name}_{suffix}"
     return name
 
 
-def add_recipe(name: str, is_low: bool) -> Tuple[bool, Optional[int], Optional[str], str]:
+def add_recipe(name: str, is_low: bool):
     try:
         name_final = ensure_unique_recipe_name(name.strip())
         cur = conn.cursor()
@@ -237,13 +237,10 @@ def meal_protein_total(day_str: str, meal_type: str) -> float:
 
 
 def day_protein_total(day_str: str) -> float:
-    total = 0.0
-    for mt in MEAL_LABELS.keys():
-        total += meal_protein_total(day_str, mt)
-    return round(total, 3)
+    return round(sum(meal_protein_total(day_str, mt) for mt in MEAL_LABELS.keys()), 3)
 
 
-def get_thresholds() -> Tuple[pd.DataFrame, float]:
+def get_thresholds():
     th = pd.read_sql_query('SELECT * FROM thresholds', conn).set_index('meal_type')
     daily = pd.read_sql_query('SELECT max_protein_g FROM thresholds_daily WHERE id = 1', conn)
     daily_max = float(daily.iloc[0,0]) if not daily.empty else 9999.0
@@ -281,84 +278,11 @@ def treatment_logs_between(start_dt: datetime, end_dt: datetime) -> pd.DataFrame
 
 
 def expected_intakes_for_periodicity(periodicity: str, day: date) -> int:
-    if periodicity == '1x/day':
-        return 1
-    if periodicity == '2x/day':
-        return 2
-    if periodicity == '3x/day':
-        return 3
-    # weekly cases: we'll handle on a weekly normalization
-    if periodicity in ('1x/week','2x/week','3x/week'):
-        return 0
-    return 0
+    return {'1x/day':1,'2x/day':2,'3x/day':3}.get(periodicity, 0)
 
 
 def weekly_expected(periodicity: str) -> int:
-    return {
-        '1x/week': 1,
-        '2x/week': 2,
-        '3x/week': 3,
-    }.get(periodicity, 0)
-
-# ---- Airtable & Export helpers ----
-
-def airtable_fetch_all(api_key: str, base_id: str, table_name: str, view: Optional[str] = None, max_records: int = 10000):
-    headers = {"Authorization": f"Bearer {api_key}"}
-    url = f"https://api.airtable.com/v0/{base_id}/{urllib.parse.quote(table_name)}"
-    params = {}
-    if view:
-        params["view"] = view
-    out = []
-    offset = None
-    fetched = 0
-    while True:
-        p = params.copy()
-        if offset:
-            p["offset"] = offset
-        resp = requests.get(url, headers=headers, params=p, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        recs = data.get("records", [])
-        out.extend(recs)
-        fetched += len(recs)
-        offset = data.get("offset")
-        if not offset or fetched >= max_records:
-            break
-    return out
-
-
-def import_foods_from_airtable(api_key: str, base_id: str, table_name: str,
-                               field_name: str, field_pack: str, field_protein: str,
-                               field_type: Optional[str] = None, field_barcode: Optional[str] = None) -> Tuple[int,int,int]:
-    records = airtable_fetch_all(api_key, base_id, table_name)
-    added = skipped = errors = 0
-    for r in records:
-        fields = r.get('fields', {})
-        try:
-            name = str(fields.get(field_name, '')).strip()
-            pack = str(fields.get(field_pack, '')).strip()
-            if not name or not pack:
-                skipped += 1
-                continue
-            protein_raw = fields.get(field_protein, 0)
-            try:
-                protein = float(protein_raw)
-            except (ValueError, TypeError):
-                skipped += 1
-                continue
-            ftype_val = (fields.get(field_type) if field_type else 'raw') or 'raw'
-            ftype = 'processed' if str(ftype_val).lower().startswith('trans') else ('raw' if str(ftype_val).lower().startswith('non') else str(ftype_val).lower())
-            if ftype not in ('raw','processed'):
-                ftype = 'raw'
-            barcode = str(fields.get(field_barcode, '')).strip() if field_barcode else None
-            ok, _, _ = upsert_food(name, pack, protein, ftype, barcode or None)
-            if ok:
-                added += 1
-            else:
-                skipped += 1
-        except Exception:
-            errors += 1
-    return added, skipped, errors
+    return {'1x/week':1, '2x/week':2, '3x/week':3}.get(periodicity, 0)
 
 
 def df_meals_between(start: date, end: date) -> pd.DataFrame:
@@ -385,8 +309,9 @@ def df_recipe_items_all() -> pd.DataFrame:
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode('utf-8')
 
+
 # ----------------------------
-# UI Components
+# UI
 # ----------------------------
 st.set_page_config(page_title="HCU – Suivi protéines & traitements", layout="wide")
 st.title("Suivi protéines & traitements – HCU")
@@ -402,11 +327,10 @@ with st.sidebar:
         "Paramètres / Seuils",
     ))
     st.markdown("---")
-    st.caption("Astuce: sur smartphone, vous pouvez ajouter des aliments transformés avec leur code barre (saisie manuelle pour l'instant).")
+    st.caption("Astuce: sur smartphone, vous pouvez ajouter des aliments transformés avec leur code barre (saisie manuelle).")
 
-# ----------------------------
+
 # Page: Suivi journalier
-# ----------------------------
 if page == "Suivi journalier":
     colL, colR = st.columns([2,1])
     with colL:
@@ -480,8 +404,8 @@ if page == "Suivi journalier":
             else:
                 st.write("Renseignez les grammes servis par ingrédient :")
                 grams_inputs = {}
-                for idx, row in items.iterrows():
-                    col1, col2, col3, col4 = st.columns([2,1,1,1])
+                for _, row in items.iterrows():
+                    col1, col2, col3, _ = st.columns([2,1,1,1])
                     with col1:
                         st.caption(f"{row['name']} ({row['pack']}) – {row['protein_per_100g']} g/100g")
                     with col2:
@@ -492,8 +416,6 @@ if page == "Suivi journalier":
                         st.write("")
                         st.write("")
                         st.write(f"= {protein_for_food(grams_inputs[row['food_id']], row['protein_per_100g'])} g prot.")
-                    with col4:
-                        st.write("")
                 if st.button("Ajouter au repas", key="add_recipe_to_meal"):
                     for fid, g in grams_inputs.items():
                         if g and g > 0:
@@ -517,7 +439,6 @@ if page == "Suivi journalier":
         foods = get_foods_df()
         if foods.empty:
             st.info("Aucun aliment. Ajoutez-en ci-dessous.")
-        # Select food
         if not foods.empty:
             food_labels = foods.apply(lambda r: f"{r['name']} – {r['pack']} ({r['protein_per_100g']} g/100g)", axis=1).tolist()
             food_map = {label: fid for label, fid in zip(food_labels, foods['id'])}
@@ -563,13 +484,11 @@ if page == "Suivi journalier":
 
     st.markdown("---")
     st.subheader("Bilan du repas / du jour")
-    # Per-meal total
     m_total = meal_protein_total(day_str, meal_type)
     th_df, daily_max = get_thresholds()
     meal_cap = float(th_df.loc[meal_type, 'max_protein_g']) if meal_type in th_df.index else 9999.0
     st.metric(label=f"{MEAL_LABELS[meal_type]} – Protéines servies", value=f"{m_total} g", delta=f"Seuil {meal_cap} g")
 
-    # Show current meal items table
     df_items = meal_items_df(day_str, meal_type)
     if not df_items.empty:
         df_view = df_items.copy()
@@ -581,13 +500,10 @@ if page == "Suivi journalier":
             remove_meal_item(int(rem_id))
             st.experimental_rerun()
 
-    # Daily total vs threshold
     d_total = day_protein_total(day_str)
     st.metric(label="Total jour – protéines servies", value=f"{d_total} g", delta=f"Seuil {daily_max} g")
 
-# ----------------------------
 # Page: Gestion base de données aliments
-# ----------------------------
 elif page == "Gestion base de données aliments":
     st.subheader("Aliments non transformés")
     with st.expander("Ajouter / modifier"):
@@ -632,9 +548,7 @@ elif page == "Gestion base de données aliments":
     else:
         st.info("Aucun aliment transformé.")
 
-# ----------------------------
 # Page: Gestion base de données recettes
-# ----------------------------
 elif page == "Gestion base de données recettes":
     st.subheader("Recettes")
 
@@ -678,9 +592,7 @@ elif page == "Gestion base de données recettes":
             items = items[['name','pack','default_grams','Prot/100g','Prot (par défaut)']]
             st.dataframe(items.rename(columns={'name':'Aliment','pack':'Cond.','default_grams':'Grammes défaut'}), use_container_width=True)
 
-# ----------------------------
 # Page: Gestion base de données traitements
-# ----------------------------
 elif page == "Gestion base de données traitements":
     st.subheader("Traitements")
 
@@ -702,40 +614,8 @@ elif page == "Gestion base de données traitements":
     else:
         st.info("Aucun traitement défini.")
 
-# ----------------------------
 # Page: Import / Export
-# ----------------------------
 elif page == "Import / Export":
-    st.subheader("Import Airtable → Aliments")
-    st.caption("Renseignez votre clé API, Base ID et nom de table. Mappez les champs si besoin.")
-
-    with st.form("airtable_conf"):
-        c1, c2 = st.columns(2)
-        api_key = c1.text_input("API Key (Airtable)", type="password")
-        base_id = c2.text_input("Base ID")
-        tname = st.text_input("Nom de la table", value="Suivi Aliments")
-
-        st.markdown("**Mapping des champs**")
-        f_name = st.text_input("Champ Nom", value="name")
-        f_pack = st.text_input("Champ Conditionnement", value="pack")
-        f_prot = st.text_input("Champ Protéines/100g", value="protein_per_100g")
-        f_type = st.text_input("Champ Type (raw/processed) (optionnel)", value="type")
-        f_bar  = st.text_input("Champ Code barre (optionnel)", value="barcode")
-
-        submitted = st.form_submit_button("Importer les aliments")
-        if submitted:
-            if not api_key or not base_id or not tname:
-                st.error("Renseignez clé API, Base ID et nom de table.")
-            else:
-                try:
-                    added, skipped, errors = import_foods_from_airtable(
-                        api_key, base_id, tname, f_name, f_pack, f_prot, f_type, f_bar
-                    )
-                    st.success(f"Import terminé – ajoutés: {added}, ignorés/duplicats: {skipped}, erreurs: {errors}")
-                except Exception as e:
-                    st.error(f"Erreur import: {e}")
-
-    st.markdown("---")
     st.subheader("Export CSV")
     dfF  = get_foods_df()
     dfR  = get_recipes_df()
@@ -759,9 +639,7 @@ elif page == "Import / Export":
         meals_df = df_meals_between(start_d, end_d)
         st.download_button("Télécharger repas.csv", to_csv_bytes(meals_df), file_name="repas.csv", mime="text/csv")
 
-# ----------------------------
 # Page: Paramètres / Seuils
-# ----------------------------
 else:
     st.subheader("Seuils protidiques")
     th_df, daily_max = get_thresholds()
@@ -782,4 +660,4 @@ else:
             save_thresholds(new_df, new_daily)
             st.success("Seuils enregistrés.")
 
-st.markdown("\n\n——\n*Construit pour suivre précisément les protéines et les traitements au quotidien (homocystinurie).*")
+st.markdown("\n\n——\n*Version locale sans SSO Apple et sans intégration Airtable. Conçue pour le suivi protéines & traitements (HCU).*")
