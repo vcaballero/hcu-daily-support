@@ -951,5 +951,57 @@ elif page == "Admin / Sécurité":
     colA, colB = st.columns(2)
     with colA:
         st.write("**État configuration Apple**")
-        st.write(f"APPLE_CLIENT_ID configuré : {'✅' if APPLE_CLIENT_ID else '❌'}")
-        st.write(f"APPLE_TEAM_ID configuré
+        st.write("APPLE_CLIENT_ID configuré :", "✅" if APPLE_CLIENT_ID else "❌")
+        st.write("APPLE_TEAM_ID configuré :", "✅" if APPLE_TEAM_ID else "❌")
+        st.write("APPLE_KEY_ID configuré :", "✅" if APPLE_KEY_ID else "❌")
+        st.write("APPLE_PRIVATE_KEY configuré :", "✅" if bool(APPLE_PRIVATE_KEY) else "❌")
+        st.write("APPLE_REDIRECT_URI configuré :", "✅" if APPLE_REDIRECT_URI else "❌")
+        st.info("Pensez à définir ces variables d'environnement dans votre hébergeur.")
+
+    with colB:
+        st.write("**Options de bootstrap**")
+        st.write(f"DISABLE_AUTH (dev) : {'ON' if DISABLE_AUTH else 'OFF'}")
+        st.write(f"OPEN_ENROLLMENT : {'ON' if OPEN_ENROLLMENT else 'OFF'}")
+
+    st.markdown("---")
+    st.write("**Gestion de la liste blanche (emails autorisés)**")
+    with st.form("allow_add"):
+        a_email = st.text_input("Email à autoriser")
+        a_name  = st.text_input("Nom (optionnel)")
+        submit_allow = st.form_submit_button("Ajouter")
+        if submit_allow and a_email:
+            add_allowed_email(a_email, a_name or None)
+            st.success("Ajouté.")
+
+    df_allow = allowed_users_df()
+    if not df_allow.empty:
+        st.dataframe(df_allow.rename(columns={'sub':'Apple ID (sub)','email':'Email','name':'Nom'}), use_container_width=True)
+        rem = st.selectbox("Supprimer l'accès pour", [None] + df_allow['email'].dropna().tolist())
+        if rem and st.button("Supprimer"):
+            remove_allowed(rem)
+            st.success("Supprimé.")
+    else:
+        st.info("Aucun utilisateur autorisé pour le moment.")
+
+# Page: Paramètres / Seuils
+else:
+    st.subheader("Seuils protidiques")
+    th_df, daily_max = get_thresholds()
+    edit = th_df.reset_index().rename(columns={'meal_type':'Repas','max_protein_g':'Seuil (g)'})
+    st.caption("Par défaut: petit-déjeuner/goûter = 2 g, déjeuner/dîner = 4 g. Modifiez si besoin.")
+    new_daily = st.number_input("Seuil total journalier (g)", min_value=0.0, step=0.5, value=float(daily_max))
+    st.dataframe(edit, use_container_width=True)
+
+    with st.form("save_thresholds_form"):
+        c1, c2, c3, c4 = st.columns(4)
+        v1 = c1.number_input("Petit déjeuner (g)", min_value=0.0, step=0.5, value=float(th_df.loc['petit_dejeuner','max_protein_g']))
+        v2 = c2.number_input("Déjeuner (g)", min_value=0.0, step=0.5, value=float(th_df.loc['dejeuner','max_protein_g']))
+        v3 = c3.number_input("Goûter (g)", min_value=0.0, step=0.5, value=float(th_df.loc['gouter','max_protein_g']))
+        v4 = c4.number_input("Dîner (g)", min_value=0.0, step=0.5, value=float(th_df.loc['diner','max_protein_g']))
+        submitted = st.form_submit_button("Enregistrer les seuils")
+        if submitted:
+            new_df = pd.DataFrame({'max_protein_g':[v1,v2,v3,v4]}, index=['petit_dejeuner','dejeuner','gouter','diner'])
+            save_thresholds(new_df, new_daily)
+            st.success("Seuils enregistrés.")
+
+st.markdown("\n\n——\n*Accès sécurisé par Connexion Apple + liste blanche. Construit pour suivre précisément les protéines et les traitements au quotidien (homocystinurie).*")
