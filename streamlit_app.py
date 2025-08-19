@@ -1,39 +1,13 @@
-import os
-import secrets
-import json
+import streamlit as st
 import sqlite3
 from datetime import datetime, date, timedelta, time
-from typing import Optional, Tuple
-
-import jwt
-from jwt import PyJWKClient
 import pandas as pd
+from typing import Optional, Tuple
 import requests
-import streamlit as st
+import io
 import urllib.parse
 
 DB_PATH = 'tracker.db'
-
-# ============================
-# Auth config (via env vars)
-# ============================
-# Required for Apple Sign‑In (configure in your deployment environment):
-#   APPLE_CLIENT_ID      -> Services ID (e.g. com.your.bundleid.web)
-#   APPLE_TEAM_ID        -> Your Apple Developer Team ID
-#   APPLE_KEY_ID         -> Key ID of your Sign in with Apple key
-#   APPLE_PRIVATE_KEY    -> Contents of your .p8 private key (use \n for line breaks)
-#   APPLE_REDIRECT_URI   -> Exact redirect URL (e.g. https://<your-app>/)
-# Optional bootstrap flags:
-#   DISABLE_AUTH=1       -> bypass auth (for local dev)
-#   OPEN_ENROLLMENT=1    -> first successful Apple login auto‑adds user to allowlist if empty
-
-APPLE_CLIENT_ID   = os.getenv('APPLE_CLIENT_ID')
-APPLE_TEAM_ID     = os.getenv('APPLE_TEAM_ID')
-APPLE_KEY_ID      = os.getenv('APPLE_KEY_ID')
-APPLE_PRIVATE_KEY = (os.getenv('APPLE_PRIVATE_KEY') or '').replace('\\n', '\n')
-APPLE_REDIRECT_URI= os.getenv('APPLE_REDIRECT_URI')
-DISABLE_AUTH      = os.getenv('DISABLE_AUTH','0') == '1'
-OPEN_ENROLLMENT   = os.getenv('OPEN_ENROLLMENT','0') == '1'
 
 # ----------------------------
 # Utilities & DB
@@ -55,7 +29,8 @@ def init_db(conn):
                pack TEXT NOT NULL,
                protein_per_100g REAL NOT NULL,
                type TEXT CHECK(type IN ("raw", "processed")) NOT NULL DEFAULT "raw",
-               barcode TEXT
+               barcode TEXT,
+               UNIQUE(name, pack, COALESCE(barcode, ''))
            )'''
     )
     # Recipes
@@ -127,20 +102,7 @@ def init_db(conn):
                max_protein_g REAL NOT NULL
            )'''
     )
-    # Allowlist (for SSO access control)
-    cur.execute(
-        '''CREATE TABLE IF NOT EXISTS allowed_users (
-               sub   TEXT PRIMARY KEY,
-               email TEXT UNIQUE,
-               name  TEXT
-           )'''
-    )
-
     # Defaults if empty
-    # uniqueness via partial indexes
-    cur.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_foods_unique_nobarcode ON foods(name, pack) WHERE barcode IS NULL')
-    cur.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_foods_unique_withbarcode ON foods(name, pack, barcode) WHERE barcode IS NOT NULL')
-
     cur.execute('SELECT COUNT(*) FROM thresholds')
     if cur.fetchone()[0] == 0:
         cur.executemany('INSERT INTO thresholds(meal_type, max_protein_g) VALUES (?,?)', [
@@ -166,7 +128,7 @@ MEAL_LABELS = {
 }
 
 # ----------------------------
-# Helper functions (data)
+# Helper functions
 # ----------------------------
 
 def protein_for_food(grams: float, protein_per_100g: float) -> float:
@@ -203,12 +165,14 @@ def upsert_food(name: str, pack: str, protein: float, ftype: str, barcode: Optio
 
 
 def ensure_unique_recipe_name(name: str) -> str:
+    # If name exists, append date suffix AAAAMMJJ as requested
     cur = conn.cursor()
     cur.execute('SELECT COUNT(*) FROM recipes WHERE name = ?', (name,))
     exists = cur.fetchone()[0] > 0
     if exists:
         suffix = datetime.now().strftime('%Y%m%d')
-        return f"{name}_{suffix}"
+        name2 = f"{name}_{suffix}"
+        return name2
     return name
 
 
@@ -273,7 +237,10 @@ def meal_protein_total(day_str: str, meal_type: str) -> float:
 
 
 def day_protein_total(day_str: str) -> float:
-    return round(sum(meal_protein_total(day_str, mt) for mt in MEAL_LABELS.keys()), 3)
+    total = 0.0
+    for mt in MEAL_LABELS.keys():
+        total += meal_protein_total(day_str, mt)
+    return round(total, 3)
 
 
 def get_thresholds() -> Tuple[pd.DataFrame, float]:
@@ -314,11 +281,24 @@ def treatment_logs_between(start_dt: datetime, end_dt: datetime) -> pd.DataFrame
 
 
 def expected_intakes_for_periodicity(periodicity: str, day: date) -> int:
-    return {'1x/day':1,'2x/day':2,'3x/day':3}.get(periodicity, 0)
+    if periodicity == '1x/day':
+        return 1
+    if periodicity == '2x/day':
+        return 2
+    if periodicity == '3x/day':
+        return 3
+    # weekly cases: we'll handle on a weekly normalization
+    if periodicity in ('1x/week','2x/week','3x/week'):
+        return 0
+    return 0
 
 
 def weekly_expected(periodicity: str) -> int:
-    return {'1x/week':1, '2x/week':2, '3x/week':3}.get(periodicity, 0)
+    return {
+        '1x/week': 1,
+        '2x/week': 2,
+        '3x/week': 3,
+    }.get(periodicity, 0)
 
 # ---- Airtable & Export helpers ----
 
@@ -406,187 +386,11 @@ def to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode('utf-8')
 
 # ----------------------------
-# Apple Sign‑In (OpenID Connect)
-# ----------------------------
-
-def _apple_client_secret(team_id: str, client_id: str, key_id: str, private_key_pem: str) -> str:
-    now = int(datetime.utcnow().timestamp())
-    payload = {
-        'iss': team_id,
-        'iat': now,
-        'exp': now + 60*60*24*180,  # max 6 months
-        'aud': 'https://appleid.apple.com',
-        'sub': client_id,
-    }
-    headers = {'kid': key_id, 'alg': 'ES256'}
-    return jwt.encode(payload, private_key_pem, algorithm='ES256', headers=headers)
-
-
-def apple_auth_url(client_id: str, redirect_uri: str, state: str) -> str:
-    base = 'https://appleid.apple.com/auth/authorize'
-    params = {
-        'response_type': 'code',
-        'response_mode': 'query',
-        'client_id': client_id,
-        'redirect_uri': redirect_uri,
-        'scope': 'name email',
-        'state': state,
-    }
-    return base + '?' + urllib.parse.urlencode(params)
-
-
-def apple_exchange_code_for_tokens(code: str, client_id: str, client_secret: str, redirect_uri: str) -> dict:
-    url = 'https://appleid.apple.com/auth/token'
-    data = {
-        'grant_type': 'authorization_code',
-        'code': code,
-        'redirect_uri': redirect_uri,
-        'client_id': client_id,
-        'client_secret': client_secret,
-    }
-    r = requests.post(url, data=data, timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-
-def verify_id_token(id_token: str, audience: str) -> dict:
-    jwks_client = PyJWKClient('https://appleid.apple.com/auth/keys')
-    signing_key = jwks_client.get_signing_key_from_jwt(id_token)
-    return jwt.decode(id_token, signing_key.key, algorithms=['RS256'], audience=audience)
-
-# Allowlist helpers
-
-def allowed_users_df() -> pd.DataFrame:
-    return pd.read_sql_query('SELECT sub, email, name FROM allowed_users ORDER BY email', conn)
-
-
-def add_allowed_email(email: str, name: Optional[str] = None):
-    cur = conn.cursor()
-    # placeholder sub until first login links it
-    cur.execute('INSERT OR IGNORE INTO allowed_users(sub, email, name) VALUES (?, ?, ?)', (email, email.lower().strip(), name))
-    conn.commit()
-
-
-def remove_allowed(email: str):
-    conn.execute('DELETE FROM allowed_users WHERE email = ?', (email.lower().strip(),))
-    conn.commit()
-
-
-def link_login_identity(sub: str, email: Optional[str], name: Optional[str]):
-    cur = conn.cursor()
-    if email:
-        # if row exists by email, update sub/name; else insert new
-        cur.execute('SELECT sub FROM allowed_users WHERE email = ?', (email.lower().strip(),))
-        row = cur.fetchone()
-        if row:
-            cur.execute('UPDATE allowed_users SET sub = ?, name = ? WHERE email = ?', (sub, name, email.lower().strip()))
-        else:
-            cur.execute('INSERT OR IGNORE INTO allowed_users(sub, email, name) VALUES (?,?,?)', (sub, email.lower().strip(), name))
-    else:
-        # no email claim → ensure sub exists
-        cur.execute('INSERT OR IGNORE INTO allowed_users(sub) VALUES (?)', (sub,))
-    conn.commit()
-
-
-def is_allowed(sub: str, email: Optional[str]) -> bool:
-    cur = conn.cursor()
-    if email:
-        cur.execute('SELECT 1 FROM allowed_users WHERE email = ? OR sub = ?', (email.lower().strip(), sub))
-    else:
-        cur.execute('SELECT 1 FROM allowed_users WHERE sub = ?', (sub,))
-    return cur.fetchone() is not None
-
-
-def allowed_count() -> int:
-    cur = conn.cursor()
-    cur.execute('SELECT COUNT(*) FROM allowed_users')
-    return int(cur.fetchone()[0])
-
-# ----------------------------
-# UI – Auth gate
+# UI Components
 # ----------------------------
 st.set_page_config(page_title="HCU – Suivi protéines & traitements", layout="wide")
+st.title("Suivi protéines & traitements – HCU")
 
-# Handle OAuth callback
-_qp = {}
-try:
-    _qp = st.query_params  # new API
-except Exception:
-    _qp = st.experimental_get_query_params()  # fallback
-
-if 'auth' not in st.session_state:
-    st.session_state['auth'] = {
-        'ok': False,
-        'email': None,
-        'sub': None,
-        'name': None,
-    }
-
-# Bypass for local dev
-if DISABLE_AUTH:
-    st.session_state['auth'] = {'ok': True, 'email': 'dev@local', 'sub': 'dev', 'name': 'Developer'}
-
-# Process callback
-if not st.session_state['auth']['ok'] and 'code' in _qp:
-    try:
-        if not (APPLE_CLIENT_ID and APPLE_TEAM_ID and APPLE_KEY_ID and APPLE_PRIVATE_KEY and APPLE_REDIRECT_URI):
-            st.error("Configuration Apple incomplète (variables d'environnement).")
-        else:
-            client_secret = _apple_client_secret(APPLE_TEAM_ID, APPLE_CLIENT_ID, APPLE_KEY_ID, APPLE_PRIVATE_KEY)
-            tokens = apple_exchange_code_for_tokens(_qp.get('code'), APPLE_CLIENT_ID, client_secret, APPLE_REDIRECT_URI)
-            id_token = tokens.get('id_token')
-            claims = verify_id_token(id_token, APPLE_CLIENT_ID)
-            email = claims.get('email')
-            sub = claims.get('sub')
-            name = None
-            # Access control
-            if allowed_count() == 0 and OPEN_ENROLLMENT:
-                # bootstrap: auto‑add first user
-                link_login_identity(sub, email, name)
-            if is_allowed(sub, email):
-                link_login_identity(sub, email, name)
-                st.session_state['auth'] = {'ok': True, 'email': email, 'sub': sub, 'name': name}
-                # Clear query params to get a clean URL
-                try:
-                    st.query_params.clear()
-                except Exception:
-                    st.experimental_set_query_params()  # clears
-            else:
-                st.error("Accès refusé : cet utilisateur n'est pas autorisé.")
-    except Exception as e:
-        st.error(f"Échec de l'authentification Apple: {e}")
-
-# Render header
-left, right = st.columns([4,1])
-with left:
-    st.title("Suivi protéines & traitements – HCU")
-with right:
-    if st.session_state['auth']['ok']:
-        u = st.session_state['auth']
-        st.caption(f"Connecté : {u['email'] or u['sub']}")
-        if st.button("Se déconnecter"):
-            st.session_state['auth'] = {'ok': False, 'email': None, 'sub': None, 'name': None}
-            try:
-                st.query_params.clear()
-            except Exception:
-                st.experimental_set_query_params()
-    else:
-        if APPLE_CLIENT_ID and APPLE_REDIRECT_URI:
-            # Create login link
-            state = secrets.token_urlsafe(16)
-            st.session_state['oauth_state'] = state
-            login_url = apple_auth_url(APPLE_CLIENT_ID, APPLE_REDIRECT_URI, state)
-            st.link_button("Se connecter avec Apple", login_url)
-        else:
-            st.info("Configurer APPLE_CLIENT_ID et APPLE_REDIRECT_URI pour activer la connexion Apple.")
-
-# If not authenticated, stop here
-if not st.session_state['auth']['ok']:
-    st.stop()
-
-# ----------------------------
-# Sidebar Navigation
-# ----------------------------
 with st.sidebar:
     st.header("Navigation")
     page = st.radio("Aller à", (
@@ -595,16 +399,14 @@ with st.sidebar:
         "Gestion base de données recettes",
         "Gestion base de données traitements",
         "Import / Export",
-        "Admin / Sécurité",
         "Paramètres / Seuils",
     ))
     st.markdown("---")
     st.caption("Astuce: sur smartphone, vous pouvez ajouter des aliments transformés avec leur code barre (saisie manuelle pour l'instant).")
 
-# ============================
-# Pages
-# ============================
+# ----------------------------
 # Page: Suivi journalier
+# ----------------------------
 if page == "Suivi journalier":
     colL, colR = st.columns([2,1])
     with colL:
@@ -678,8 +480,8 @@ if page == "Suivi journalier":
             else:
                 st.write("Renseignez les grammes servis par ingrédient :")
                 grams_inputs = {}
-                for _, row in items.iterrows():
-                    col1, col2, col3, _ = st.columns([2,1,1,1])
+                for idx, row in items.iterrows():
+                    col1, col2, col3, col4 = st.columns([2,1,1,1])
                     with col1:
                         st.caption(f"{row['name']} ({row['pack']}) – {row['protein_per_100g']} g/100g")
                     with col2:
@@ -690,6 +492,8 @@ if page == "Suivi journalier":
                         st.write("")
                         st.write("")
                         st.write(f"= {protein_for_food(grams_inputs[row['food_id']], row['protein_per_100g'])} g prot.")
+                    with col4:
+                        st.write("")
                 if st.button("Ajouter au repas", key="add_recipe_to_meal"):
                     for fid, g in grams_inputs.items():
                         if g and g > 0:
@@ -713,6 +517,7 @@ if page == "Suivi journalier":
         foods = get_foods_df()
         if foods.empty:
             st.info("Aucun aliment. Ajoutez-en ci-dessous.")
+        # Select food
         if not foods.empty:
             food_labels = foods.apply(lambda r: f"{r['name']} – {r['pack']} ({r['protein_per_100g']} g/100g)", axis=1).tolist()
             food_map = {label: fid for label, fid in zip(food_labels, foods['id'])}
@@ -758,11 +563,13 @@ if page == "Suivi journalier":
 
     st.markdown("---")
     st.subheader("Bilan du repas / du jour")
+    # Per-meal total
     m_total = meal_protein_total(day_str, meal_type)
     th_df, daily_max = get_thresholds()
     meal_cap = float(th_df.loc[meal_type, 'max_protein_g']) if meal_type in th_df.index else 9999.0
     st.metric(label=f"{MEAL_LABELS[meal_type]} – Protéines servies", value=f"{m_total} g", delta=f"Seuil {meal_cap} g")
 
+    # Show current meal items table
     df_items = meal_items_df(day_str, meal_type)
     if not df_items.empty:
         df_view = df_items.copy()
@@ -774,10 +581,13 @@ if page == "Suivi journalier":
             remove_meal_item(int(rem_id))
             st.experimental_rerun()
 
+    # Daily total vs threshold
     d_total = day_protein_total(day_str)
     st.metric(label="Total jour – protéines servies", value=f"{d_total} g", delta=f"Seuil {daily_max} g")
 
+# ----------------------------
 # Page: Gestion base de données aliments
+# ----------------------------
 elif page == "Gestion base de données aliments":
     st.subheader("Aliments non transformés")
     with st.expander("Ajouter / modifier"):
@@ -822,7 +632,9 @@ elif page == "Gestion base de données aliments":
     else:
         st.info("Aucun aliment transformé.")
 
+# ----------------------------
 # Page: Gestion base de données recettes
+# ----------------------------
 elif page == "Gestion base de données recettes":
     st.subheader("Recettes")
 
@@ -866,7 +678,9 @@ elif page == "Gestion base de données recettes":
             items = items[['name','pack','default_grams','Prot/100g','Prot (par défaut)']]
             st.dataframe(items.rename(columns={'name':'Aliment','pack':'Cond.','default_grams':'Grammes défaut'}), use_container_width=True)
 
+# ----------------------------
 # Page: Gestion base de données traitements
+# ----------------------------
 elif page == "Gestion base de données traitements":
     st.subheader("Traitements")
 
@@ -888,7 +702,9 @@ elif page == "Gestion base de données traitements":
     else:
         st.info("Aucun traitement défini.")
 
+# ----------------------------
 # Page: Import / Export
+# ----------------------------
 elif page == "Import / Export":
     st.subheader("Import Airtable → Aliments")
     st.caption("Renseignez votre clé API, Base ID et nom de table. Mappez les champs si besoin.")
@@ -943,47 +759,9 @@ elif page == "Import / Export":
         meals_df = df_meals_between(start_d, end_d)
         st.download_button("Télécharger repas.csv", to_csv_bytes(meals_df), file_name="repas.csv", mime="text/csv")
 
-# Page: Admin / Sécurité
-elif page == "Admin / Sécurité":
-    st.subheader("Accès sécurisé")
-    st.caption("Seuls les utilisateurs sur liste blanche peuvent accéder après Connexion Apple.")
-
-    colA, colB = st.columns(2)
-    with colA:
-        st.write("**État configuration Apple**")
-        st.write("APPLE_CLIENT_ID configuré :", "✅" if APPLE_CLIENT_ID else "❌")
-        st.write("APPLE_TEAM_ID configuré :", "✅" if APPLE_TEAM_ID else "❌")
-        st.write("APPLE_KEY_ID configuré :", "✅" if APPLE_KEY_ID else "❌")
-        st.write("APPLE_PRIVATE_KEY configuré :", "✅" if bool(APPLE_PRIVATE_KEY) else "❌")
-        st.write("APPLE_REDIRECT_URI configuré :", "✅" if APPLE_REDIRECT_URI else "❌")
-        st.info("Pensez à définir ces variables d'environnement dans votre hébergeur.")
-
-    with colB:
-        st.write("**Options de bootstrap**")
-        st.write(f"DISABLE_AUTH (dev) : {'ON' if DISABLE_AUTH else 'OFF'}")
-        st.write(f"OPEN_ENROLLMENT : {'ON' if OPEN_ENROLLMENT else 'OFF'}")
-
-    st.markdown("---")
-    st.write("**Gestion de la liste blanche (emails autorisés)**")
-    with st.form("allow_add"):
-        a_email = st.text_input("Email à autoriser")
-        a_name  = st.text_input("Nom (optionnel)")
-        submit_allow = st.form_submit_button("Ajouter")
-        if submit_allow and a_email:
-            add_allowed_email(a_email, a_name or None)
-            st.success("Ajouté.")
-
-    df_allow = allowed_users_df()
-    if not df_allow.empty:
-        st.dataframe(df_allow.rename(columns={'sub':'Apple ID (sub)','email':'Email','name':'Nom'}), use_container_width=True)
-        rem = st.selectbox("Supprimer l'accès pour", [None] + df_allow['email'].dropna().tolist())
-        if rem and st.button("Supprimer"):
-            remove_allowed(rem)
-            st.success("Supprimé.")
-    else:
-        st.info("Aucun utilisateur autorisé pour le moment.")
-
+# ----------------------------
 # Page: Paramètres / Seuils
+# ----------------------------
 else:
     st.subheader("Seuils protidiques")
     th_df, daily_max = get_thresholds()
@@ -1004,4 +782,4 @@ else:
             save_thresholds(new_df, new_daily)
             st.success("Seuils enregistrés.")
 
-st.markdown("\n\n——\n*Accès sécurisé par Connexion Apple + liste blanche. Construit pour suivre précisément les protéines et les traitements au quotidien (homocystinurie).*")
+st.markdown("\n\n——\n*Construit pour suivre précisément les protéines et les traitements au quotidien (homocystinurie).*")
